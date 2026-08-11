@@ -1071,6 +1071,17 @@ def to_dark_glyph(image, color=(26, 26, 26)):
 # Снимане на съставни елементи с браузър
 # ---------------------------------------------------------------------------
 
+def bundled_browser_candidates():
+    """Връща пътя към Chromium, ако е вграден в PyInstaller EXE-то."""
+    if getattr(sys, "frozen", False):
+        root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        return [
+            root / "chromium" / "chrome.exe",
+            root / "chromium" / "chrome-win" / "chrome.exe",
+        ]
+    return []
+
+
 BROWSER_CANDIDATES = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
@@ -1084,6 +1095,11 @@ BROWSER_CANDIDATES = [
 
 
 def find_browser():
+    # Първо търсим Chromium, вграден в самия EXE.
+    for candidate in bundled_browser_candidates():
+        if Path(candidate).exists():
+            return str(candidate)
+
     for name in ("google-chrome", "chromium", "chromium-browser"):
         found = shutil.which(name)
 
