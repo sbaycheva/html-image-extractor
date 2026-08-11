@@ -16,11 +16,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyInstaller
-        run: pip install pyinstaller
+      - name: Install PyInstaller and libraries
+        run: pip install pyinstaller python-docx lxml pillow
 
       - name: Build EXE
-        run: pyinstaller --onefile --windowed --name html-image-extractor html_image_extractor.py
+        run: >
+          pyinstaller --onefile --windowed --clean --noconfirm
+          --name HTML-Image-Extractor
+          --collect-all docx
+          html_image_extractor.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
