@@ -1,7 +1,12 @@
 """
 HTML Image Extractor - извлича вградените снимки от HTML и прави Word документ.
 
-Един файл без вътрешни зависимости, за да може да се пакетира направо.
+Един файл, който сам се грижи за всичко.
+
+Библиотеките за Word - python-docx, lxml и Pillow - носят машинен код и
+не могат да се препишат тук. Затова при първото пускане програмата ги
+сваля сама в собствена папка и показва прозорче с хода. След това тръгва
+веднага и работи без интернет. Нищо не се инсталира на ръка.
 
 Какво прави:
   • намира вградените Base64 изображения и ги записва като PNG, изрязани
@@ -21,8 +26,11 @@ import base64
 import binascii
 import hashlib
 import html
+import importlib
 import io
+import json
 import os
+import platform
 import queue
 import re
 import shutil
@@ -30,10 +38,842 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.error
+import urllib.request
+import zipfile
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+
+# =========================================================================
+# Самоподготовка на библиотеките
+# =========================================================================
+
+# Word документът се прави с python-docx, lxml и Pillow. Те носят
+# компилирани части и затова не могат да се препишат в този файл. Вместо
+# това при първото пускане се свалят сами в отделна папка на потребителя.
+# Следващите пускания са мигновени и минават без интернет.
+
+APP_NAME = "HTML Image Extractor"
+
+FOLDER_NAME = "HtmlImageExtractor"
+
+# Модулът, който се проверява, и пакетът, който се сваля за него.
+REQUIRED_MODULES = (
+    ("lxml", "lxml"),
+    ("PIL", "pillow"),
+    ("docx", "python-docx"),
+)
+
+# Пакети, които вървят заедно с друг пакет.
+COMPANION_PACKAGES = {
+    "python-docx": ("typing-extensions",),
+}
+
+PYPI_INDEX = "https://pypi.org/simple/{}/"
+
+PYPI_METADATA = "https://pypi.org/pypi/{}/json"
+
+USER_AGENT = "html-image-extractor"
+
+# име-версия[-построяване]-python-abi-платформа.whl
+WHEEL_NAME = re.compile(
+    r"^(?P<name>[^-]+)-(?P<version>[^-]+)"
+    r"(?:-(?P<build>\d[^-]*))?"
+    r"-(?P<python>[^-]+)-(?P<abi>[^-]+)-(?P<platform>[^-]+)\.whl$",
+    re.IGNORECASE,
+)
+
+
+def needed_by_downloaded_packages():
+    """
+    Изброява частите от стандартната библиотека, които python-docx, lxml
+    и Pillow ползват.
+
+    Тази функция никога не се вика. Стои, защото при сглобяване с
+    PyInstaller вътре влиза само това, което се вижда написано в кода.
+    Пакетите, свалени чак след сглобяването, не могат да се обадят какво
+    им трябва, затова нуждите им са изброени тук - иначе сглобеният файл
+    ги сваля успешно, но после те не тръгват.
+    """
+    import __future__
+    import argparse
+    import array
+    import atexit
+    import bisect
+    import calendar
+    import cmath
+    import collections.abc
+    import contextlib
+    import copy
+    import csv
+    import dataclasses
+    import datetime
+    import decimal
+    import difflib
+    import enum
+    import fnmatch
+    import fractions
+    import functools
+    import getpass
+    import glob
+    import gzip
+    import heapq
+    import hmac
+    import inspect
+    import itertools
+    import logging
+    import logging.handlers
+    import math
+    import mimetypes
+    import numbers
+    import operator
+    import pathlib
+    import pickle
+    import posixpath
+    import pprint
+    import random
+    import secrets
+    import shlex
+    import stat
+    import string
+    import struct
+    import textwrap
+    import time
+    import traceback
+    import types
+    import typing
+    import unicodedata
+    import urllib.parse
+    import uuid
+    import warnings
+    import weakref
+    import xml.dom.minidom
+    import xml.etree.ElementTree
+    import xml.parsers.expat
+    import xml.sax
+
+
+def hidden_process_flags():
+    """Пречи на Windows да мига с черен прозорец при външна команда."""
+    if sys.platform.startswith("win"):
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+    return {}
+
+
+def application_folder():
+    """Папката, в която стои програмата - или .py файлът, или .exe файлът."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+
+    return Path(__file__).resolve().parent
+
+
+def library_key():
+    """
+    Отпечатък на средата.
+
+    Свалените пакети съдържат машинен код и важат само за една версия на
+    Python върху една архитектура, затова всяка комбинация си има папка.
+    """
+    return "py{}{}-{}-{}".format(
+        sys.version_info[0],
+        sys.version_info[1],
+        sys.platform,
+        (platform.machine() or "unknown").lower(),
+    )
+
+
+def library_folder():
+    """Постоянното място за свалените библиотеки."""
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.join(
+            os.path.expanduser("~"), "Library", "Application Support"
+        )
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share"
+        )
+
+    return Path(base) / FOLDER_NAME / "libs" / library_key()
+
+
+def add_to_path(folder):
+    text = str(folder)
+
+    if text not in sys.path:
+        sys.path.insert(0, text)
+
+
+def missing_packages(reasons=None):
+    """
+    Връща пакетите, които в момента не могат да се заредят.
+
+    В reasons се събира по коя причина всеки от тях не тръгва - иначе
+    после остава само едно „липсва“ без обяснение.
+    """
+    importlib.invalidate_caches()
+
+    missing = []
+
+    for module_name, package_name in REQUIRED_MODULES:
+        try:
+            importlib.import_module(module_name)
+        except Exception as error:
+            missing.append(package_name)
+
+            if reasons is not None:
+                reasons[package_name] = "{}: {}".format(
+                    type(error).__name__,
+                    error,
+                )
+
+    return missing
+
+
+# ---------------------------------------------------------------------------
+# Избор на подходящ пакет за тази машина
+# ---------------------------------------------------------------------------
+
+def python_tags():
+    major, minor = sys.version_info[:2]
+
+    return {
+        "cp{}{}".format(major, minor),
+        "py{}{}".format(major, minor),
+        "py{}".format(major),
+        "cp{}".format(major),
+    }
+
+
+def abi_tags():
+    major, minor = sys.version_info[:2]
+
+    return {
+        "none",
+        "abi3",
+        "cp{}{}".format(major, minor),
+        "cp{}{}m".format(major, minor),
+    }
+
+
+def macos_version():
+    try:
+        pieces = platform.mac_ver()[0].split(".")
+
+        return (int(pieces[0]), int(pieces[1]) if len(pieces) > 1 else 0)
+    except (IndexError, ValueError):
+        return (99, 0)
+
+
+def platform_matches(tag):
+    """Проверява дали един етикет за платформа върви на тази машина."""
+    if tag == "any":
+        return True
+
+    machine = (platform.machine() or "").lower()
+
+    if sys.platform.startswith("win"):
+        if machine in ("amd64", "x86_64"):
+            return tag == "win_amd64"
+
+        if machine in ("arm64", "aarch64"):
+            return tag == "win_arm64"
+
+        return tag == "win32"
+
+    if sys.platform == "darwin":
+        match = re.match(r"^macosx_(\d+)_(\d+)_(.+)$", tag)
+
+        if not match:
+            return False
+
+        needed = (int(match.group(1)), int(match.group(2)))
+
+        if needed > macos_version():
+            return False
+
+        architecture = match.group(3)
+
+        if machine == "arm64":
+            return architecture in ("arm64", "universal2")
+
+        return architecture in (
+            "x86_64",
+            "universal2",
+            "intel",
+            "fat64",
+            "fat32",
+            "universal",
+        )
+
+    if machine in ("x86_64", "amd64"):
+        endings = ("_x86_64",)
+    elif machine in ("aarch64", "arm64"):
+        endings = ("_aarch64",)
+    elif machine.startswith("armv7"):
+        endings = ("_armv7l",)
+    else:
+        endings = ("_" + machine,)
+
+    if not tag.startswith(("manylinux", "musllinux", "linux")):
+        return False
+
+    return tag.endswith(endings)
+
+
+def python_allows(specifier):
+    """Проверява requires-python, записан като '>=3.9, <4'."""
+    if not specifier:
+        return True
+
+    current = sys.version_info[:3]
+
+    for part in specifier.split(","):
+        match = re.match(
+            r"^\s*(==|!=|<=|>=|~=|<|>)\s*([0-9][0-9a-zA-Z.*+!-]*)\s*$",
+            part,
+        )
+
+        if not match:
+            continue
+
+        operator = match.group(1)
+        raw = match.group(2).split("+")[0]
+        wildcard = raw.endswith(".*")
+
+        if wildcard:
+            raw = raw[:-2]
+
+        wanted = tuple(
+            int(piece) for piece in raw.split(".") if piece.isdigit()
+        )
+
+        if not wanted:
+            continue
+
+        here = current[: len(wanted)]
+
+        while len(here) < len(wanted):
+            here += (0,)
+
+        if operator == ">=" and here < wanted:
+            return False
+
+        if operator == ">" and here <= wanted:
+            return False
+
+        if operator == "<=" and here > wanted:
+            return False
+
+        if operator == "<" and here >= wanted:
+            return False
+
+        if operator == "==" and here != wanted:
+            return False
+
+        if operator == "!=" and here == wanted:
+            return False
+
+        if operator == "~=" and here < wanted:
+            return False
+
+    return True
+
+
+def tags_match(match):
+    """Етикетите могат да са слети с точка: py2.py3-none-any"""
+    if not set(match.group("python").split(".")) & python_tags():
+        return False
+
+    if not set(match.group("abi").split(".")) & abi_tags():
+        return False
+
+    return any(
+        platform_matches(tag) for tag in match.group("platform").split(".")
+    )
+
+
+def version_key(version):
+    """Подрежда версиите по числата, после по добавката след тях."""
+    match = re.match(r"^(\d+(?:\.\d+)*)(.*)$", version)
+
+    if not match:
+        return ((0,), version)
+
+    numbers = tuple(int(piece) for piece in match.group(1).split("."))
+
+    return (numbers, match.group(2))
+
+
+def is_stable(version):
+    """Пробните издания - 12.5.0b1, 2.0rc1 - не стават за всеки ден."""
+    match = re.match(r"^(\d+(?:\.\d+)*)(.*)$", version)
+
+    if not match:
+        return False
+
+    rest = match.group(2)
+
+    return rest == "" or rest.startswith(".post")
+
+
+def choose_wheel(listing):
+    """
+    Избира най-новия пакет, който пасва на тази машина.
+
+    Пробните издания се гледат само ако няма нито едно редовно - иначе
+    една бета версия с по-голямо число би изместила готовата.
+    """
+    best = [None, None]
+
+    for entry in listing:
+        filename = entry.get("filename") or ""
+
+        if not filename.lower().endswith(".whl") or entry.get("yanked"):
+            continue
+
+        match = WHEEL_NAME.match(filename)
+
+        if not match or not tags_match(match):
+            continue
+
+        limit = entry.get("requires-python") or entry.get("requires_python")
+
+        if not python_allows(limit):
+            continue
+
+        version = match.group("version")
+        slot = 0 if is_stable(version) else 1
+        key = version_key(version)
+
+        if best[slot] is None or key > best[slot][0]:
+            best[slot] = (key, entry, filename)
+
+    chosen = best[0] or best[1]
+
+    if chosen is None:
+        return None
+
+    return chosen[1], chosen[2]
+
+
+# ---------------------------------------------------------------------------
+# Сваляне
+# ---------------------------------------------------------------------------
+
+def open_url(url, accept=None):
+    headers = {"User-Agent": USER_AGENT}
+
+    if accept:
+        headers["Accept"] = accept
+
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers=headers),
+        timeout=60,
+    )
+
+
+def read_simple_index(package_name):
+    """Официалният списък с файлове на пакета."""
+    url = PYPI_INDEX.format(package_name.lower().replace("_", "-"))
+
+    with open_url(url, "application/vnd.pypi.simple.v1+json") as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    return data.get("files") or []
+
+
+def read_legacy_index(package_name):
+    """Резервен списък, ако новият отговор не се разчете."""
+    with open_url(PYPI_METADATA.format(package_name)) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    files = []
+
+    for entries in (data.get("releases") or {}).values():
+        for entry in entries:
+            files.append(
+                {
+                    "filename": entry.get("filename"),
+                    "url": entry.get("url"),
+                    "requires-python": entry.get("requires_python"),
+                    "yanked": entry.get("yanked"),
+                    "hashes": entry.get("digests") or {},
+                }
+            )
+
+    return files
+
+
+def read_index(package_name):
+    try:
+        return read_simple_index(package_name)
+    except (urllib.error.URLError, ValueError, OSError):
+        return read_legacy_index(package_name)
+
+
+def download(url, report):
+    pieces = []
+    received = 0
+
+    with open_url(url) as response:
+        try:
+            size = int(response.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            size = 0
+
+        while True:
+            piece = response.read(65536)
+
+            if not piece:
+                break
+
+            pieces.append(piece)
+            received += len(piece)
+            report(received, size)
+
+    return b"".join(pieces)
+
+
+def extract_wheel(raw, target):
+    """Разопакова пакета направо в папката, както прави pip --target."""
+    target.mkdir(parents=True, exist_ok=True)
+    root = target.resolve()
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        for item in archive.infolist():
+            if item.filename.endswith("/"):
+                continue
+
+            parts = item.filename.split("/")
+
+            # Съдържанието на .data папката се разгъва в корена.
+            if len(parts) > 2 and parts[0].endswith(".data"):
+                if parts[1] not in ("purelib", "platlib"):
+                    continue
+
+                parts = parts[2:]
+
+            if not parts or ".." in parts:
+                continue
+
+            destination = target.joinpath(*parts)
+
+            if root not in destination.resolve().parents:
+                continue
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+
+            with archive.open(item) as source:
+                with open(str(destination), "wb") as output:
+                    shutil.copyfileobj(source, output)
+
+            mode = (item.external_attr >> 16) & 0o777
+
+            # Архивите от Windows нямат права, там режимът се пропуска.
+            if mode:
+                os.chmod(str(destination), mode)
+
+
+def fetch_libraries(packages, target, report):
+    """Сваля и разопакова пакетите. Връща текст с грешка или None."""
+    total = len(packages)
+
+    for index, package_name in enumerate(packages):
+        base = index / float(total)
+        step = 1.0 / total
+
+        report("Търся {}...".format(package_name), base)
+
+        try:
+            listing = read_index(package_name)
+        except Exception as error:
+            return "Няма връзка с pypi.org: {}".format(error)
+
+        chosen = choose_wheel(listing)
+
+        if chosen is None:
+            return (
+                "За {} няма готов пакет за Python {}.{} на тази машина."
+            ).format(package_name, sys.version_info[0], sys.version_info[1])
+
+        entry, filename = chosen
+
+        def progress(received, size, name=filename, start=base, span=step):
+            if size:
+                report(
+                    "Свалям {}".format(name),
+                    start + span * 0.9 * received / size,
+                )
+            else:
+                report("Свалям {}".format(name), None)
+
+        try:
+            raw = download(entry.get("url"), progress)
+        except Exception as error:
+            return "Свалянето на {} не стана: {}".format(filename, error)
+
+        digest = (entry.get("hashes") or {}).get("sha256")
+
+        if digest and hashlib.sha256(raw).hexdigest() != digest:
+            return "Файлът {} се получи повреден.".format(filename)
+
+        report("Разопаковам {}".format(filename), base + step * 0.95)
+
+        try:
+            extract_wheel(raw, target)
+        except Exception as error:
+            return "Разопаковането на {} не стана: {}".format(filename, error)
+
+    report("Готово.", 1.0)
+
+    return None
+
+
+def install_with_pip(packages, target):
+    """Резервен път през pip. Връща текст с грешка или None при успех."""
+    if getattr(sys, "frozen", False):
+        return "В сглобения файл няма pip."
+
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-input",
+        "--disable-pip-version-check",
+        "--upgrade",
+        "--target",
+        str(target),
+    ] + list(packages)
+
+    for attempt in range(2):
+        try:
+            finished = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=1800,
+                **hidden_process_flags()
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            return "pip не тръгна: {}".format(error)
+
+        if finished.returncode == 0:
+            return None
+
+        output = (finished.stdout or b"").decode("utf-8", "replace")
+
+        if attempt == 0 and "No module named pip" in output:
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "ensurepip", "--default-pip"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=600,
+                    **hidden_process_flags()
+                )
+            except (OSError, subprocess.SubprocessError):
+                return "pip липсва и не може да се създаде."
+
+            continue
+
+        return "pip спря с грешка:\n{}".format(output.strip()[-400:])
+
+    return "pip не успя."
+
+
+# ---------------------------------------------------------------------------
+# Показване на хода
+# ---------------------------------------------------------------------------
+
+class ConsoleProgress:
+    """Изписва хода в конзолата - за пускане от командния ред."""
+
+    def run(self, work):
+        # Свалянето вика доклад на всяко парче, затова се изписва само
+        # когато има какво ново да се каже.
+        last = [None]
+
+        def report(message, fraction):
+            step = message if fraction is None else (
+                message,
+                int(fraction * 100),
+            )
+
+            if step == last[0]:
+                return
+
+            last[0] = step
+
+            if fraction is None:
+                print("  {}".format(message))
+            else:
+                print("  {} {:3.0f}%".format(message, fraction * 100))
+
+            sys.stdout.flush()
+
+        return work(report)
+
+
+class WindowProgress:
+    """Малко прозорче с лента, докато свалянето върви в отделна нишка."""
+
+    def run(self, work):
+        outcome = {}
+        updates = queue.Queue()
+
+        root = tk.Tk()
+        root.title(APP_NAME)
+        root.resizable(False, False)
+        root.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        frame = ttk.Frame(root, padding=24)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text="Подготвям нужните компоненти",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(anchor="w")
+
+        ttk.Label(
+            frame,
+            text=(
+                "Това се случва само първия път и трае около минута.\n"
+                "Нужен е интернет. После програмата тръгва веднага."
+            ),
+            justify="left",
+        ).pack(anchor="w", pady=(6, 14))
+
+        bar = ttk.Progressbar(frame, length=440, maximum=100)
+        bar.pack(fill="x")
+
+        status = ttk.Label(frame, text="Започвам...", width=58, anchor="w")
+        status.pack(anchor="w", pady=(10, 0))
+
+        def report(message, fraction):
+            updates.put((message, fraction))
+
+        def worker():
+            try:
+                outcome["value"] = work(report)
+            except Exception as error:
+                outcome["value"] = str(error)
+
+            updates.put(None)
+
+        def drain():
+            finished = False
+
+            try:
+                while True:
+                    update = updates.get_nowait()
+
+                    if update is None:
+                        finished = True
+                        continue
+
+                    message, fraction = update
+                    status.configure(text=message)
+
+                    if fraction is not None:
+                        bar.configure(value=max(0.0, min(1.0, fraction)) * 100)
+            except queue.Empty:
+                pass
+
+            if finished:
+                root.destroy()
+            else:
+                root.after(80, drain)
+
+        threading.Thread(target=worker, daemon=True).start()
+        root.after(80, drain)
+        root.mainloop()
+
+        return outcome.get("value")
+
+
+def prepare_libraries():
+    """
+    Осигурява библиотеките за Word.
+
+    Връща None при успех или текст с грешка, ако нищо не се е получило.
+    Ако пакетите вече са налице, не се пипа мрежата и не се вижда нищо.
+    """
+    portable = application_folder() / "_libs" / library_key()
+    private = library_folder()
+
+    for folder in (portable, private):
+        if folder.is_dir():
+            add_to_path(folder)
+
+    missing = missing_packages()
+
+    if not missing:
+        return None
+
+    wanted = []
+
+    for package_name in missing:
+        for companion in COMPANION_PACKAGES.get(package_name, ()):
+            if companion not in wanted:
+                wanted.append(companion)
+
+        if package_name not in wanted:
+            wanted.append(package_name)
+
+    try:
+        private.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        return "Няма достъп до папката {}: {}".format(private, error)
+
+    add_to_path(private)
+
+    def work(report):
+        error = fetch_libraries(wanted, private, report)
+
+        if error is None:
+            return None
+
+        report("Опитвам по друг начин, с pip...", None)
+
+        if install_with_pip(wanted, private) is None:
+            return None
+
+        return error
+
+    if len(sys.argv) > 1:
+        print("Липсват компоненти, свалям ги еднократно...")
+        error = ConsoleProgress().run(work)
+    else:
+        try:
+            error = WindowProgress().run(work)
+        except tk.TclError:
+            error = ConsoleProgress().run(work)
+
+    if error is not None:
+        return error
+
+    reasons = {}
+    still = missing_packages(reasons)
+
+    if still:
+        return "Свалянето мина, но {} не тръгва: {}".format(
+            ", ".join(still),
+            " | ".join(reasons.values()),
+        )
+
+    return None
+
+
+BOOTSTRAP_ERROR = prepare_libraries()
 
 
 # Word документът изисква външни библиотеки. Ако липсват, приложението
@@ -50,7 +890,7 @@ try:
 
     CONVERTER_ERROR = None
 except ImportError as error:
-    CONVERTER_ERROR = str(error)
+    CONVERTER_ERROR = BOOTSTRAP_ERROR or str(error)
 
 
 # =========================================================================
@@ -1071,17 +1911,6 @@ def to_dark_glyph(image, color=(26, 26, 26)):
 # Снимане на съставни елементи с браузър
 # ---------------------------------------------------------------------------
 
-def bundled_browser_candidates():
-    """Връща пътя към Chromium, ако е вграден в PyInstaller EXE-то."""
-    if getattr(sys, "frozen", False):
-        root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-        return [
-            root / "chromium" / "chrome.exe",
-            root / "chromium" / "chrome-win" / "chrome.exe",
-        ]
-    return []
-
-
 BROWSER_CANDIDATES = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
@@ -1095,11 +1924,6 @@ BROWSER_CANDIDATES = [
 
 
 def find_browser():
-    # Първо търсим Chromium, вграден в самия EXE.
-    for candidate in bundled_browser_candidates():
-        if Path(candidate).exists():
-            return str(candidate)
-
     for name in ("google-chrome", "chromium", "chromium-browser"):
         found = shutil.which(name)
 
@@ -1223,6 +2047,7 @@ class ElementRenderer:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=90,
+                **hidden_process_flags()
             )
 
             if shot.exists():
@@ -2493,11 +3318,13 @@ class HTMLImageExtractorApp:
             ttk.Label(
                 options_frame,
                 text=(
-                    "Липсват библиотеки за Word. Инсталирай ги с:\n"
-                    "pip3 install --user pillow python-docx"
-                ),
+                    "Компонентите за Word не можаха да се подготвят:\n"
+                    "{}\n\n"
+                    "Пусни програмата пак с включен интернет."
+                ).format(CONVERTER_ERROR),
                 foreground="#a05000",
                 justify="left",
+                wraplength=560,
             ).pack(anchor="w", pady=(6, 0))
 
     def add_log(self, message):
@@ -2711,8 +3538,8 @@ def main():
     # С подадени файлове работи от командния ред, иначе отваря прозореца.
     if len(sys.argv) > 1:
         if CONVERTER_ERROR is not None:
-            print("Липсват библиотеки: {}".format(CONVERTER_ERROR))
-            print("Инсталирай ги с: pip3 install pillow python-docx")
+            print("Компонентите за Word не са готови: {}".format(CONVERTER_ERROR))
+            print("Пусни командата пак с включен интернет.")
             return 1
 
         for name in sys.argv[1:]:
